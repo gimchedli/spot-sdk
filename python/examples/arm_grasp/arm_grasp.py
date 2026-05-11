@@ -104,7 +104,18 @@ def arm_object_grasp(config):
         # Show the image to the user and wait for them to click on a pixel
         robot.logger.info('Click on an object to start grasping...')
         image_title = 'Click to grasp'
-        cv2.namedWindow(image_title)
+        #cv2.namedWindow(image_title)
+        #cv2.setMouseCallback(image_title, cv_mouse_callback)
+
+        # --- UPDATED CODE ---
+        image_title = 'Click to grasp'
+        # WINDOW_NORMAL allows the window to be resized manually or via code
+        cv2.namedWindow(image_title, cv2.WINDOW_NORMAL) 
+
+        # Set the window to a specific size (Width, Height)
+        # Try 1280x720 or 1920x1080 depending on your monitor
+        cv2.resizeWindow(image_title, 1280, 720) 
+
         cv2.setMouseCallback(image_title, cv_mouse_callback)
 
         global g_image_click, g_image_display
@@ -129,6 +140,8 @@ def arm_object_grasp(config):
             pixel_xy=pick_vec, transforms_snapshot_for_camera=image.shot.transforms_snapshot,
             frame_name_image_sensor=image.shot.frame_name_image_sensor,
             camera_model=image.source.pinhole)
+
+        grasp.walk_gaze_mode = manipulation_api_pb2.PICK_NO_AUTO_WALK_OR_GAZE
 
         # Optionally add a grasp constraint.  This lets you tell the robot you only want top-down grasps or side-on grasps.
         add_grasp_constraint(config, grasp, robot_state_client)

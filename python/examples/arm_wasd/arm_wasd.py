@@ -32,10 +32,10 @@ from bosdyn.util import duration_str, format_metric, secs_to_hms
 
 LOGGER = logging.getLogger()
 
-VELOCITY_CMD_DURATION = 0.5  # seconds
+VELOCITY_CMD_DURATION = 0.25  # seconds
 COMMAND_INPUT_RATE = 0.1
-VELOCITY_HAND_NORMALIZED = 0.5  # normalized hand velocity [0,1]
-VELOCITY_ANGULAR_HAND = 1.0  # rad/sec
+VELOCITY_HAND_NORMALIZED = 0.15  # normalized hand velocity [0,1]
+VELOCITY_ANGULAR_HAND = 0.5  # rad/sec
 
 
 class ExitCheck(object):
