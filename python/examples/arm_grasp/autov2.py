@@ -6,6 +6,7 @@
 import argparse
 import sys
 import time
+import math
 from pathlib import Path
 
 import cv2
@@ -17,7 +18,6 @@ import bosdyn.client.lease
 import bosdyn.client.util
 from bosdyn.api import estop_pb2, geometry_pb2, image_pb2, manipulation_api_pb2
 from bosdyn.client.estop import EstopClient
-# Added get_a_tform_b to extract exact frames for Cartesian math
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, get_vision_tform_body, get_a_tform_b, math_helpers
 from bosdyn.client.image import ImageClient, pixel_format_to_numpy_type, pixel_to_camera_space
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
@@ -274,7 +274,12 @@ def run_auto_grasp(config):
         start_x = vision_T_body.x
         start_y = vision_T_body.y
         start_yaw = vision_T_body.rot.to_yaw()
-        # ----------------------------
+
+        # Unstow gently to see straight ahead, then open jaws
+        robot.logger.info('Unstowing arm to a relaxed position to see the target...')
+        carry_cmd = RobotCommandBuilder.arm_carry_command()
+        command_client.robot_command(carry_cmd)
+        time.sleep(2.0)
 
         robot.logger.info('Opening gripper jaws to clear camera view...')
         gripper_open_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(1.0)
@@ -374,31 +379,56 @@ def run_auto_grasp(config):
             
             snapshot = image.shot.transforms_snapshot
             vision_T_camera = get_a_tform_b(snapshot, VISION_FRAME_NAME, image.shot.frame_name_image_sensor)
-            vision_T_hand = get_a_tform_b(snapshot, VISION_FRAME_NAME, 'hand')
             
             # Target in Vision Frame
             camera_T_target = math_helpers.SE3Pose(cam_point[0], cam_point[1], cam_point[2], math_helpers.Quat())
             vision_T_target = vision_T_camera * camera_T_target
             
-            # Distance from the palm center to fingertips + half cube
+            # --- WALK TO TARGET (0.75m Standoff) ---
+            robot_state = robot_state_client.get_robot_state()
+            vision_T_body = get_vision_tform_body(robot_state.kinematic_state.transforms_snapshot)
+            
+            dx = vision_T_target.x - vision_T_body.x
+            dy = vision_T_target.y - vision_T_body.y
+            dist = math.sqrt(dx**2 + dy**2)
+            
+            if dist > 0.8:
+                robot.logger.info(f'Target is {dist:.2f}m away. Walking closer...')
+                heading = math.atan2(dy, dx)
+                standoff_x = vision_T_target.x - 0.75 * math.cos(heading)
+                standoff_y = vision_T_target.y - 0.75 * math.sin(heading)
+                
+                approach_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
+                    goal_x=standoff_x,
+                    goal_y=standoff_y,
+                    goal_heading=heading,
+                    frame_name=VISION_FRAME_NAME
+                )
+                command_client.robot_command(approach_cmd, end_time_secs=time.time() + 15.0)
+                time.sleep(dist / 0.4) # Spot walks ~0.4m/s
+                time.sleep(2.0) # Extra buffer time
+                
+                # Refresh hand position AFTER walking
+                robot_state = robot_state_client.get_robot_state()
+            
+            vision_T_hand = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot, VISION_FRAME_NAME, 'hand')
+
+            # --- REACH OUT AND PINCH ---
             pull_back_m = 0.16 + ((config.cube_size / 2.0) / 100.0)
             
-            # Find the vector pointing forward from the hand
-            hand_forward_v = vision_T_hand.rotation.transform_vec3(math_helpers.Vec3(1.0, 0.0, 0.0))
+            hx = vision_T_target.x - vision_T_hand.x
+            hy = vision_T_target.y - vision_T_hand.y
+            hz = vision_T_target.z - vision_T_hand.z
+            h_dist = math.sqrt(hx**2 + hy**2 + hz**2)
             
-            # Desired hand position
-            target_p = vision_T_target.position
-            new_hand_p = math_helpers.Vec3(
-                target_p.x - hand_forward_v.x * pull_back_m,
-                target_p.y - hand_forward_v.y * pull_back_m,
-                target_p.z - hand_forward_v.z * pull_back_m
-            )
+            new_hand_x = vision_T_target.x - (hx / h_dist) * pull_back_m
+            new_hand_y = vision_T_target.y - (hy / h_dist) * pull_back_m
+            new_hand_z = vision_T_target.z - (hz / h_dist) * pull_back_m
             
             new_vision_T_hand = math_helpers.SE3Pose(
-                new_hand_p.x, new_hand_p.y, new_hand_p.z, vision_T_hand.rotation
+                new_hand_x, new_hand_y, new_hand_z, vision_T_hand.rotation
             )
             
-            # Move arm
             arm_cmd = RobotCommandBuilder.arm_pose_command(
                 new_vision_T_hand.x, new_vision_T_hand.y, new_vision_T_hand.z,
                 new_vision_T_hand.rot.w, new_vision_T_hand.rot.x, new_vision_T_hand.rot.y, new_vision_T_hand.rot.z,
@@ -409,7 +439,6 @@ def run_auto_grasp(config):
             command_client.robot_command(arm_cmd)
             time.sleep(4.5) 
             
-            # Snapshot 2
             robot.logger.info('Taking Snapshot 2 before gripping...')
             image_responses_2 = image_client.get_image_from_sources([config.image_source])
             if len(image_responses_2) == 1:
@@ -417,15 +446,12 @@ def run_auto_grasp(config):
                 save_image_to_arm_grasp_folder(img_array2, 'snapshot_2_before_grip.jpg')
                 robot.logger.info('Saved Snapshot 2 successfully.')
                 
-            # Pinch
             robot.logger.info('Pinching cube with fingertips...')
             close_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(0.0)
             command_client.robot_command(close_cmd)
             time.sleep(1.0)
             
             robot.logger.info('Finished Cartesian fingertip grasp.')
-            
-            # NOTE: Removed the 'return' and 'power_off' from here so it flows to the Reset block!
 
         # =======================================================================
         # STANDARD AUTO-GRASP FALLBACK (If --cube-size is not provided)
@@ -494,8 +520,7 @@ def run_auto_grasp(config):
             
             robot.logger.info('Finished standard grasp attempt.')
 
-
- # =======================================================================
+        # =======================================================================
         # RESET AND RETURN SEQUENCE (Runs for both Cartesian and Auto-Grasp)
         # =======================================================================
         robot.logger.info('Holding target for 3 seconds...')
@@ -512,17 +537,16 @@ def run_auto_grasp(config):
         time.sleep(3.0)
 
         robot.logger.info('Walking back to recorded starting position...')
-        return_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(
+        return_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
             goal_x=start_x,
             goal_y=start_y,
             goal_heading=start_yaw,
             frame_name=VISION_FRAME_NAME
         )
-        
-        # FIX: Added end_time_secs. Without this, Spot ignores the walk command!
+        # Execute walk with an expiration timer so Spot doesn't ignore it
         command_client.robot_command(return_cmd, end_time_secs=time.time() + 15.0)
         
-        # Give Spot 10 seconds to physically walk back
+        # Give Spot time to walk back
         time.sleep(10.0) 
 
         # Cleanly close the OpenCV window to prevent UI memory heap spam
@@ -564,7 +588,6 @@ def parse_arguments():
                         help='Force a 45-degree angled grasp.')
     parser.add_argument('-s', '--force-squeeze-grasp', action='store_true',
                         help='Force a squeeze grasp.')
-    # NEW ARGUMENT HERE
     parser.add_argument('--cube-size', type=float, default=None,
                         help='Size of the cube in cm. If provided, the robot bypasses the auto-planner to attempt a delicate Cartesian fingertip pinch.')
     return parser.parse_args()
