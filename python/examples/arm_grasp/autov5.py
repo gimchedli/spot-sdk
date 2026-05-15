@@ -4,10 +4,13 @@
 # - Searches all cameras for AprilTags.
 # - Does NOT rotate Spot during search.
 # - Uses body height changes to handle vertical visibility problems.
-# - Keeps live camera view for monitoring.
+# - Keeps one live camera view for monitoring.
 # - Final grasp is attempted only from hand_color_image.
+# - Default grasp orientation is frontal with wrist rolled 90 degrees.
+# - Always releases object before stowing/returning to start.
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -29,6 +32,8 @@ from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder, blocking_stand
 from bosdyn.client.robot_state import RobotStateClient
 
+
+WINDOW_NAME = "Spot AprilTag Search"
 
 ALL_CAMERAS = [
     "hand_color_image",
@@ -76,16 +81,32 @@ def image_proto_to_array(image_proto):
         arr = np.frombuffer(img.data, dtype=dtype)
 
         if img.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
-            return arr.reshape(img.rows, img.cols, 3)
+            rgb = arr.reshape(img.rows, img.cols, 3)
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
         if hasattr(image_pb2.Image, "PIXEL_FORMAT_RGBA_U8"):
             if img.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
-                return arr.reshape(img.rows, img.cols, 4)
+                rgba = arr.reshape(img.rows, img.cols, 4)
+                return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
 
         return arr.reshape(img.rows, img.cols)
 
-    decoded = cv2.imdecode(np.frombuffer(img.data, dtype=np.uint8), -1)
+    decoded = cv2.imdecode(np.frombuffer(img.data, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+
+    if decoded is None:
+        raise RuntimeError(f"Could not decode image from source: {image_proto.source.name}")
+
     return decoded
+
+
+def ensure_bgr(image):
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    if image.ndim == 3 and image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+
+    return image.copy()
 
 
 def safe_get_images_from_sources(image_client, sources, robot_logger=None):
@@ -98,7 +119,10 @@ def safe_get_images_from_sources(image_client, sources, robot_logger=None):
         return image_client.get_image_from_sources(unique_sources)
     except Exception as exc:
         if robot_logger:
-            robot_logger.warning("Batch image request failed. Falling back to individual requests: %s", exc)
+            robot_logger.warning(
+                "Batch image request failed. Falling back to individual requests: %s",
+                exc,
+            )
 
     responses = []
     for src in unique_sources:
@@ -129,10 +153,14 @@ def find_target_pixel_by_apriltag(image, dict_name="DICT_APRILTAG_36H11"):
     if image is None:
         return None
 
-    if image.ndim == 3:
+    if image.ndim == 2:
+        gray = image
+    elif image.ndim == 3 and image.shape[2] == 4:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    elif image.ndim == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
-        gray = image
+        return None
 
     try:
         dict_id = get_marker_dictionary_id(dict_name)
@@ -219,8 +247,7 @@ def send_body_height(command_client, body_height_m, settle_sec=0.8):
 
 
 def draw_detection(display, detection, source_name, body_height):
-    if display.ndim == 2:
-        display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
+    display = ensure_bgr(display)
 
     if detection:
         x, y = detection["center"]
@@ -261,6 +288,16 @@ def draw_detection(display, detection, source_name, body_height):
         2,
     )
 
+    cv2.putText(
+        display,
+        "Search movement: body height only. No rotation.",
+        (10, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 0),
+        2,
+    )
+
     return display
 
 
@@ -277,6 +314,7 @@ def scan_all_cameras_for_tags(image_client, config, robot_logger=None):
         try:
             arr = image_proto_to_array(response)
             detection = find_target_pixel_by_apriltag(arr, config.apriltag_dict)
+
             if detection:
                 source_name = response.source.name
                 detection["source"] = source_name
@@ -285,6 +323,7 @@ def scan_all_cameras_for_tags(image_client, config, robot_logger=None):
                 detection["rows"] = arr.shape[0]
                 detection["cols"] = arr.shape[1]
                 detections[source_name] = detection
+
         except Exception as exc:
             if robot_logger:
                 robot_logger.debug("Detection failed for image source: %s", exc)
@@ -322,6 +361,7 @@ def update_body_height_from_detection(command_client, detection, current_height,
         return current_height, False
 
     delta = -config.body_height_gain * vertical_error_norm
+
     new_height = clamp(
         current_height + delta,
         config.body_height_min,
@@ -402,6 +442,7 @@ def wait_until_hand_camera_sees_tag(image_client, command_client, config, robot_
             )
 
             hand_detection = detections.get(HAND_CAMERA)
+
             if hand_detection:
                 _, tag_y = hand_detection["center"]
                 rows = hand_detection["rows"]
@@ -417,6 +458,7 @@ def wait_until_hand_camera_sees_tag(image_client, command_client, config, robot_
 
         else:
             now = time.time()
+
             if now - last_sweep_time > config.body_height_sweep_interval_sec:
                 current_height = sweep_heights[sweep_idx % len(sweep_heights)]
                 sweep_idx += 1
@@ -435,6 +477,7 @@ def wait_until_hand_camera_sees_tag(image_client, command_client, config, robot_
 
         if config.show_image:
             display_source = ALL_CAMERAS[display_idx % len(ALL_CAMERAS)]
+
             responses = safe_get_images_from_sources(
                 image_client,
                 [display_source],
@@ -445,7 +488,6 @@ def wait_until_hand_camera_sees_tag(image_client, command_client, config, robot_
                 display_response = responses[0]
                 display_arr = image_proto_to_array(display_response)
 
-                display_detection = None
                 if display_source in detections:
                     display_detection = detections[display_source]
                 else:
@@ -461,7 +503,7 @@ def wait_until_hand_camera_sees_tag(image_client, command_client, config, robot_
                     current_height,
                 )
 
-                cv2.imshow("Spot AprilTag Search", display)
+                cv2.imshow(WINDOW_NAME, display)
                 key = cv2.waitKey(1) & 0xFF
 
                 if key in (ord("c"), ord("C")):
@@ -476,17 +518,43 @@ def wait_until_hand_camera_sees_tag(image_client, command_client, config, robot_
         time.sleep(config.scan_sleep_sec)
 
 
+def get_selected_grasp_orientation(config):
+    legacy_flags = [
+        config.force_top_down_grasp,
+        config.force_horizontal_grasp,
+        config.force_45_angle_grasp,
+        config.force_squeeze_grasp,
+    ]
+
+    if sum(legacy_flags) > 1:
+        raise RuntimeError("Choose at most one grasp constraint.")
+
+    if config.force_top_down_grasp:
+        return "top_down"
+
+    if config.force_horizontal_grasp:
+        return "horizontal"
+
+    if config.force_45_angle_grasp:
+        return "angle_45"
+
+    if config.force_squeeze_grasp:
+        return "squeeze"
+
+    return config.grasp_orientation
+
+
 def add_grasp_constraint(config, grasp, robot_state_client):
-    use_vector_constraint = config.force_top_down_grasp or config.force_horizontal_grasp
+    orientation = get_selected_grasp_orientation(config)
+
+    if orientation == "unconstrained":
+        return
+
     grasp.grasp_params.grasp_params_frame_name = VISION_FRAME_NAME
 
-    if use_vector_constraint:
-        if config.force_top_down_grasp:
-            axis_on_gripper = geometry_pb2.Vec3(x=1, y=0, z=0)
-            axis_to_align = geometry_pb2.Vec3(x=0, y=0, z=-1)
-        else:
-            axis_on_gripper = geometry_pb2.Vec3(x=0, y=1, z=0)
-            axis_to_align = geometry_pb2.Vec3(x=0, y=0, z=1)
+    if orientation == "top_down":
+        axis_on_gripper = geometry_pb2.Vec3(x=1, y=0, z=0)
+        axis_to_align = geometry_pb2.Vec3(x=0, y=0, z=-1)
 
         constraint = grasp.grasp_params.allowable_orientation.add()
         constraint.vector_alignment_with_tolerance.axis_on_gripper_ewrt_gripper.CopyFrom(
@@ -495,23 +563,68 @@ def add_grasp_constraint(config, grasp, robot_state_client):
         constraint.vector_alignment_with_tolerance.axis_to_align_with_ewrt_frame.CopyFrom(
             axis_to_align
         )
-        constraint.vector_alignment_with_tolerance.threshold_radians = config.grasp_constraint_tolerance_rad
+        constraint.vector_alignment_with_tolerance.threshold_radians = (
+            config.grasp_constraint_tolerance_rad
+        )
 
-    elif config.force_45_angle_grasp:
+    elif orientation == "horizontal":
+        axis_on_gripper = geometry_pb2.Vec3(x=0, y=1, z=0)
+        axis_to_align = geometry_pb2.Vec3(x=0, y=0, z=1)
+
+        constraint = grasp.grasp_params.allowable_orientation.add()
+        constraint.vector_alignment_with_tolerance.axis_on_gripper_ewrt_gripper.CopyFrom(
+            axis_on_gripper
+        )
+        constraint.vector_alignment_with_tolerance.axis_to_align_with_ewrt_frame.CopyFrom(
+            axis_to_align
+        )
+        constraint.vector_alignment_with_tolerance.threshold_radians = (
+            config.grasp_constraint_tolerance_rad
+        )
+
+    elif orientation == "frontal":
         robot_state = robot_state_client.get_robot_state()
-        vision_T_body = get_vision_tform_body(robot_state.kinematic_state.transforms_snapshot)
-        body_Q_grasp = math_helpers.Quat.from_pitch(0.785398)
+        vision_T_body = get_vision_tform_body(
+            robot_state.kinematic_state.transforms_snapshot
+        )
+
+        body_Q_grasp = math_helpers.Quat.from_roll(
+            math.radians(config.wrist_roll_deg)
+        )
+
         vision_Q_grasp = vision_T_body.rotation * body_Q_grasp
 
         constraint = grasp.grasp_params.allowable_orientation.add()
         constraint.rotation_with_tolerance.rotation_ewrt_frame.CopyFrom(
             vision_Q_grasp.to_proto()
         )
-        constraint.rotation_with_tolerance.threshold_radians = config.grasp_constraint_tolerance_rad
+        constraint.rotation_with_tolerance.threshold_radians = (
+            config.grasp_constraint_tolerance_rad
+        )
 
-    elif config.force_squeeze_grasp:
+    elif orientation == "angle_45":
+        robot_state = robot_state_client.get_robot_state()
+        vision_T_body = get_vision_tform_body(
+            robot_state.kinematic_state.transforms_snapshot
+        )
+
+        body_Q_grasp = math_helpers.Quat.from_pitch(math.radians(45.0))
+        vision_Q_grasp = vision_T_body.rotation * body_Q_grasp
+
+        constraint = grasp.grasp_params.allowable_orientation.add()
+        constraint.rotation_with_tolerance.rotation_ewrt_frame.CopyFrom(
+            vision_Q_grasp.to_proto()
+        )
+        constraint.rotation_with_tolerance.threshold_radians = (
+            config.grasp_constraint_tolerance_rad
+        )
+
+    elif orientation == "squeeze":
         constraint = grasp.grasp_params.allowable_orientation.add()
         constraint.squeeze_grasp.SetInParent()
+
+    else:
+        raise RuntimeError(f"Unknown grasp orientation: {orientation}")
 
 
 def reacquire_hand_target(image_client, config, robot_logger):
@@ -558,6 +671,7 @@ def reacquire_hand_target(image_client, config, robot_logger):
 def execute_grasp(
     manipulation_api_client,
     robot_state_client,
+    command_client,
     image_response,
     detection,
     config,
@@ -583,6 +697,14 @@ def execute_grasp(
         grasp.walk_gaze_mode = manipulation_api_pb2.PICK_NO_AUTO_WALK_OR_GAZE
         robot_logger.info("Using PICK_NO_AUTO_WALK_OR_GAZE to avoid search/planner rotation.")
 
+    selected_orientation = get_selected_grasp_orientation(config)
+    robot_logger.info(
+        "Using grasp orientation: %s, wrist_roll_deg=%.1f, tolerance_rad=%.2f",
+        selected_orientation,
+        config.wrist_roll_deg,
+        config.grasp_constraint_tolerance_rad,
+    )
+
     add_grasp_constraint(config, grasp, robot_state_client)
 
     grasp_request = manipulation_api_pb2.ManipulationApiRequest(
@@ -595,7 +717,22 @@ def execute_grasp(
 
     robot_logger.info("Manipulation command sent. Waiting for feedback...")
 
+    start_time = time.time()
+    last_state = None
+
     while True:
+        if time.time() - start_time > config.grasp_timeout_sec:
+            robot_logger.warning("Grasp timed out after %.1f seconds.", config.grasp_timeout_sec)
+            return manipulation_api_pb2.MANIP_STATE_GRASP_FAILED
+
+        if config.show_image:
+            key = cv2.waitKey(1) & 0xFF
+
+            if key in (ord("q"), ord("Q"), 27):
+                robot_logger.warning("User requested stop during grasp feedback.")
+                send_zero_velocity(command_client)
+                raise KeyboardInterrupt("Stopped by user during grasp feedback.")
+
         time.sleep(0.25)
 
         feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(
@@ -606,17 +743,30 @@ def execute_grasp(
             manipulation_api_feedback_request=feedback_request
         )
 
-        state_name = manipulation_api_pb2.ManipulationFeedbackState.Name(
-            response.current_state
-        )
+        current_state = response.current_state
 
-        robot_logger.info("Manipulation state: %s", state_name)
+        if current_state != last_state:
+            try:
+                state_name = manipulation_api_pb2.ManipulationFeedbackState.Name(current_state)
+            except Exception:
+                state_name = str(current_state)
 
-        if response.current_state in (
+            robot_logger.info("Manipulation state: %s", state_name)
+            last_state = current_state
+
+        if current_state in (
             manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED,
             manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
         ):
-            return response.current_state
+            return current_state
+
+
+def release_gripper(command_client, robot_logger, wait_sec=1.0):
+    robot_logger.info("Opening gripper before stowing/returning...")
+    command_client.robot_command(
+        RobotCommandBuilder.claw_gripper_open_fraction_command(1.0)
+    )
+    time.sleep(wait_sec)
 
 
 def run(config):
@@ -667,9 +817,17 @@ def run(config):
         vision_T_body = get_vision_tform_body(
             initial_state.kinematic_state.transforms_snapshot
         )
+
         start_x = vision_T_body.x
         start_y = vision_T_body.y
         start_yaw = vision_T_body.rot.to_yaw()
+
+        robot.logger.info(
+            "Recorded start pose: x=%.3f, y=%.3f, yaw=%.3f",
+            start_x,
+            start_y,
+            start_yaw,
+        )
 
         robot.logger.info("Moving arm to ready position...")
         command_client.robot_command(RobotCommandBuilder.arm_ready_command())
@@ -691,19 +849,23 @@ def run(config):
                 robot.logger,
             )
         except KeyboardInterrupt:
-            robot.logger.warning("Interrupted by user. Stowing arm and powering off.")
+            robot.logger.warning("Interrupted by user. Stopping motion, stowing arm, and powering off.")
+            send_zero_velocity(command_client)
             command_client.robot_command(RobotCommandBuilder.arm_stow_command())
             time.sleep(2.0)
-            robot.power_off(cut_immediately=False, timeout_sec=20)
+
+            if config.show_image:
+                cv2.destroyAllWindows()
+
+            if config.power_off:
+                robot.power_off(cut_immediately=False, timeout_sec=20)
+
             return
 
         clean_img = hand_detection["image_array"]
         save_image(clean_img, "snapshot_1_hand_camera_clean.jpg")
 
-        annotated = clean_img.copy()
-        if annotated.ndim == 2:
-            annotated = cv2.cvtColor(annotated, cv2.COLOR_GRAY2BGR)
-
+        annotated = ensure_bgr(clean_img)
         x, y = hand_detection["center"]
         cv2.circle(annotated, (x, y), 12, (0, 255, 0), 2)
         save_image(annotated, "snapshot_1_hand_camera_target.jpg")
@@ -715,42 +877,60 @@ def run(config):
             robot.logger,
         )
 
-        annotated_final = final_arr.copy()
-        if annotated_final.ndim == 2:
-            annotated_final = cv2.cvtColor(annotated_final, cv2.COLOR_GRAY2BGR)
-
+        annotated_final = ensure_bgr(final_arr)
         fx, fy = final_detection["center"]
         cv2.circle(annotated_final, (fx, fy), 12, (0, 255, 0), 2)
+
+        corners = final_detection.get("corners")
+        if corners is not None:
+            pts = corners.astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(annotated_final, [pts], True, (0, 255, 0), 2)
+
+        cv2.putText(
+            annotated_final,
+            f"Final target before grasp: ({fx},{fy})",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2,
+        )
+
         save_image(annotated_final, "snapshot_2_final_before_grasp.jpg")
 
         if config.show_image:
-            cv2.imshow("Final Target Before Grasp", annotated_final)
+            cv2.imshow(WINDOW_NAME, annotated_final)
             cv2.waitKey(500)
 
         robot.logger.info("Executing grasp from hand camera target.")
-        result = execute_grasp(
-            manipulation_api_client,
-            robot_state_client,
-            final_image,
-            final_detection,
-            config,
-            robot.logger,
-        )
+
+        result = None
+
+        try:
+            result = execute_grasp(
+                manipulation_api_client,
+                robot_state_client,
+                command_client,
+                final_image,
+                final_detection,
+                config,
+                robot.logger,
+            )
+        except KeyboardInterrupt:
+            robot.logger.warning("Interrupted during grasp.")
+            send_zero_velocity(command_client)
 
         if result == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED:
             robot.logger.info("Grasp succeeded.")
         else:
-            robot.logger.warning("Grasp failed.")
+            robot.logger.warning("Grasp failed or was interrupted.")
 
         robot.logger.info("Holding for %.1f seconds...", config.hold_sec)
         time.sleep(config.hold_sec)
 
-        if config.release_after_grasp:
-            robot.logger.info("Releasing gripper...")
-            command_client.robot_command(
-                RobotCommandBuilder.claw_gripper_open_fraction_command(1.0)
-            )
-            time.sleep(1.0)
+        # Important fix:
+        # Always release before stowing and before returning to start.
+        release_gripper(command_client, robot.logger, wait_sec=1.0)
 
         robot.logger.info("Stowing arm...")
         command_client.robot_command(RobotCommandBuilder.arm_stow_command())
@@ -886,57 +1066,89 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--grasp-orientation",
+        default="frontal",
+        choices=[
+            "frontal",
+            "top_down",
+            "horizontal",
+            "angle_45",
+            "squeeze",
+            "unconstrained",
+        ],
+        help="Default is frontal. Use unconstrained to let planner choose.",
+    )
+
+    parser.add_argument(
+        "--wrist-roll-deg",
+        type=float,
+        default=90.0,
+        help="Wrist roll for frontal grasp. Try -90 if the wrist is flipped.",
+    )
+
+    parser.add_argument(
         "-t",
         "--force-top-down-grasp",
         action="store_true",
-        help="Force top-down grasp orientation.",
+        help="Legacy shortcut: force top-down grasp orientation.",
     )
 
     parser.add_argument(
         "-f",
         "--force-horizontal-grasp",
         action="store_true",
-        help="Force horizontal grasp orientation.",
+        help="Legacy shortcut: force horizontal grasp orientation.",
     )
 
     parser.add_argument(
         "-r",
         "--force-45-angle-grasp",
         action="store_true",
-        help="Force 45-degree grasp orientation.",
+        help="Legacy shortcut: force 45-degree grasp orientation.",
     )
 
     parser.add_argument(
         "-s",
         "--force-squeeze-grasp",
         action="store_true",
-        help="Force squeeze grasp.",
+        help="Legacy shortcut: force squeeze grasp.",
     )
 
     parser.add_argument(
         "--grasp-constraint-tolerance-rad",
         type=float,
-        default=0.17,
-        help="Grasp orientation tolerance in radians.",
+        default=0.35,
+        help="Grasp orientation tolerance in radians. Start loose, then tighten.",
+    )
+
+    parser.add_argument(
+        "--grasp-timeout-sec",
+        type=float,
+        default=30.0,
+        help="Maximum time to wait for manipulation feedback.",
     )
 
     parser.add_argument(
         "--hold-sec",
         type=float,
         default=3.0,
-        help="Seconds to hold object after grasp attempt.",
+        help="Seconds to hold object after grasp attempt before releasing.",
     )
 
-    parser.add_argument(
-        "--release-after-grasp",
-        action="store_true",
-        help="Open gripper after grasp attempt.",
-    )
+    parser.set_defaults(return_to_start=True)
 
     parser.add_argument(
         "--return-to-start",
+        dest="return_to_start",
         action="store_true",
-        help="Walk back to starting pose after grasp. Disabled by default to avoid extra rotation.",
+        help="Walk back to starting pose after grasp. Enabled by default.",
+    )
+
+    parser.add_argument(
+        "--no-return-to-start",
+        dest="return_to_start",
+        action="store_false",
+        help="Do not walk back to starting pose after grasp.",
     )
 
     parser.add_argument(
@@ -968,7 +1180,7 @@ def main():
     )
 
     if grasp_constraint_count > 1:
-        print("Error: choose at most one grasp constraint.")
+        print("Error: choose at most one legacy force-* grasp constraint.")
         return False
 
     try:
@@ -978,6 +1190,12 @@ def main():
         logger = bosdyn.client.util.get_logger()
         logger.exception("Script failed.")
         return False
+    finally:
+        try:
+            if "options" in locals() and getattr(options, "show_image", False):
+                cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
